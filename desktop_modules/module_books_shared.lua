@@ -27,6 +27,17 @@ local math_floor = math.floor
 local math_max   = math.max
 local math_min   = math.min
 
+-- Rakuyomi (the manga reader koplugin) stores every downloaded chapter under
+-- a "rakuyomi/" folder inside the KOReader home directory (e.g.
+-- .../koreader/rakuyomi/downloads/<source>/<manga>/<chapter>.cbz). Those
+-- entries land in ReadHistory like any other book, which would otherwise
+-- flood Currently Reading / Recent Books with individual chapters. Matched
+-- as a path segment (surrounded by slashes) so it can't misfire on an
+-- unrelated file merely containing "rakuyomi" in its name.
+local function _isRakuyomiPath(fp)
+    return fp ~= nil and fp:lower():find("/rakuyomi/", 1, true) ~= nil
+end
+
 -- Returns the KOBO_VIRTUAL:// path for a real kepub filepath when the
 -- kobo.koplugin is active, or the original filepath otherwise.
 -- This ensures that covers and sidecars are looked up via the virtual path
@@ -721,21 +732,32 @@ function SH.prefetchBooks(show_currently, show_recent, max_recent)
     end
 
     local DS = getDocSettings()
-    -- hist[1] is the most recently read book.
-    -- • show_currently=true  → claim it as current_fp; never add to recent_fps.
-    -- • show_currently=false → treat it like any other entry for recent_fps.
+    -- hist[1] is normally the most recently read book, and is the first entry
+    -- eligible to become current_fp — EXCEPT that Rakuyomi chapters are
+    -- skipped entirely (never claimed as current, never added to recent_fps),
+    -- which lets the next history entry take the "currently reading" slot
+    -- instead of leaving it blank just because the last thing read was a
+    -- manga chapter. `current_slot_open` tracks whether that slot is still up
+    -- for grabs; it starts as show_currently and is set false the moment a
+    -- non-Rakuyomi entry has taken it.
+    -- • show_currently=true  → first eligible entry claims current_fp; never
+    --   also added to recent_fps.
+    -- • show_currently=false → every eligible entry treated like any other
+    --   for recent_fps.
     -- Always start at index 1 so hist[1] is never silently dropped.
+    local current_slot_open = show_currently
     for i = 1, #(ReadHistory.hist or {}) do
         local entry = ReadHistory.hist[i]
         local fp = entry and entry.file
-        if fp and lfs.attributes(fp, "mode") == "file" then
+        if fp and lfs.attributes(fp, "mode") == "file" and not _isRakuyomiPath(fp) then
             -- Normalise to KOBO_VIRTUAL:// if this is a real kepub path saved
             -- by the kobo.koplugin into ReadHistory. Using the virtual path as
             -- the key ensures cover extraction and sidecar lookups go through
             -- the kobo.koplugin's BookInfoManager patch, and that openBook
             -- passes the correct path to DocumentRegistry for DRM decryption.
             fp = _koboVirtualPath(fp)
-            if i == 1 and show_currently then
+            if current_slot_open then
+                current_slot_open = false
                 -- Claim as currently-reading book.
                 state.current_fp = fp
                 if DS then
@@ -782,8 +804,10 @@ function SH.prefetchBooks(show_currently, show_recent, max_recent)
                     end
                 end
             elseif show_recent and #state.recent_fps < max_recent then
-                -- i==1 only reaches here when show_currently==false, so hist[1]
-                -- is correctly included in recent rather than being skipped.
+                -- Reached whenever this entry didn't claim current_slot_open —
+                -- either show_currently is off, or an earlier entry already
+                -- took the slot — so hist[1] is correctly included in recent
+                -- rather than being skipped when show_currently==false.
                 local pct = 0
                 local book_summary = nil
                 if DS then
