@@ -59,6 +59,7 @@ local MODULES = {
     { require_mod = "desktop_modules/module_quote"         },
     { require_mod = "desktop_modules/module_currently"     },
     { require_mod = "desktop_modules/module_book_rows"     },   -- Recent Books + New Books + TBR
+    { require_mod = "desktop_modules/module_rakuyomi_row"  },
     { require_mod = "desktop_modules/module_coverdeck"     },
     { require_mod = "desktop_modules/module_collections"   },
     { require_mod = "desktop_modules/module_coll_row"      },
