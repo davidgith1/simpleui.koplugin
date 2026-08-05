@@ -4612,6 +4612,17 @@ function M.installAll(plugin)
     -- Wallpaper in FM and fullscreen overlay surfaces.
     M.patchWallpaperFM(plugin)
 
+    -- Bar Injection: keep the navbar visible on third-party plugin screens
+    -- that identify themselves by name. Purely passive — matching is done by
+    -- widget_name only, so registering here has zero effect unless a widget
+    -- with that exact name is actually shown, which only happens if the
+    -- corresponding plugin is installed and its screen carries the tag.
+    UI.BarInjection.register{
+        id          = "vnds_library",
+        widget_name = "vnds_library",
+        is_pageable = false,
+    }
+
     -- ------------------------------------------------------------------
     -- Reader-only patches.
     --
