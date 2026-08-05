@@ -4623,12 +4623,15 @@ function M.installAll(plugin)
         id          = "vnds_library",
         widget_name = "vnds_library",
     }
-    -- rakuyomi's LibraryView already ships its own `name = "library_view"`
-    -- (frontend/rakuyomi.koplugin/LibraryView.lua) — no source patch needed there.
-    UI.BarInjection.register{
-        id          = "rakuyomi_library",
-        widget_name = "library_view",
-    }
+    -- NOTE: a "library_view" descriptor for rakuyomi's LibraryView was tried
+    -- here and reverted — rakuyomi's Menu is a heavily customised
+    -- MenuCustom/MenuItemCover widget, and something in the injection
+    -- pipeline below (built for KOReader's own Collections/History/
+    -- homescreen widgets) throws before reaching orig_show(), which
+    -- silently swallows the widget entirely (UIManager.show's pcall only
+    -- logs the error) — net effect: tapping into rakuyomi did nothing and
+    -- the FM just stayed on screen. Needs a device-side error log from that
+    -- pcall before re-attempting.
 
     -- ------------------------------------------------------------------
     -- Reader-only patches.
