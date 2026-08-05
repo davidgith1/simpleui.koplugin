@@ -4617,10 +4617,17 @@ function M.installAll(plugin)
     -- widget_name only, so registering here has zero effect unless a widget
     -- with that exact name is actually shown, which only happens if the
     -- corresponding plugin is installed and its screen carries the tag.
+    -- is_pageable is left unset so it falls back to the same page_num
+    -- auto-detection used for the native Collections/History cases.
     UI.BarInjection.register{
         id          = "vnds_library",
         widget_name = "vnds_library",
-        is_pageable = false,
+    }
+    -- rakuyomi's LibraryView already ships its own `name = "library_view"`
+    -- (frontend/rakuyomi.koplugin/LibraryView.lua) — no source patch needed there.
+    UI.BarInjection.register{
+        id          = "rakuyomi_library",
+        widget_name = "library_view",
     }
 
     -- ------------------------------------------------------------------
