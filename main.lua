@@ -1166,6 +1166,84 @@ function SimpleUIPlugin:init()
                 local ok, Updater = pcall(require, "sui_updater")
                 if ok and Updater then Updater.scheduleAutoCheck() end
             end)
+            -- Warm up the Rakuyomi backend after first paint so the "Rakuyomi
+            -- Library" home-screen row can populate on its own. That row
+            -- (desktop_modules/module_rakuyomi_row.lua) deliberately never
+            -- starts Rakuyomi's HTTP backend itself: initialize()'s
+            -- waitUntilHttpServerIsReady() blocks for seconds (minutes on slow
+            -- devices) and would freeze the first home-screen paint, so until
+            -- the user opened Rakuyomi once the row stayed empty. Doing the
+            -- warm-up here, well after the FileManager UI is stable, keeps that
+            -- cost off the critical path. scheduleIn(5) trails the module
+            -- preload (2) and the update check (3).
+            UIManager:scheduleIn(5, function()
+                -- Skip entirely unless the row is actually enabled somewhere
+                -- (main homescreen or the quick-actions strip). It ships
+                -- default-off, so a plain isTrue() check is sufficient.
+                if not (SUISettings:isTrue("simpleui_hs_rakuyomi_row_enabled")
+                        or SUISettings:isTrue("simpleui_hs_qa_rakuyomi_row_enabled")) then
+                    return
+                end
+                if self._sui_rakuyomi_warmup_started then return end
+                self._sui_rakuyomi_warmup_started = true
+
+                local ok_pl, PluginLoader = pcall(require, "pluginloader")
+                if not (ok_pl and PluginLoader) then return end
+                local ok_inst, inst = pcall(PluginLoader.getPluginInstance, PluginLoader, "rakuyomi")
+                if not (ok_inst and inst) then return end
+                local ok_b, Backend = pcall(require, "Backend")
+                if not (ok_b and type(Backend) == "table"
+                            and type(Backend.getBackend)     == "function"
+                            and type(Backend.getInitialized) == "function"
+                            and type(Backend.requestJson)    == "function") then
+                    return
+                end
+
+                -- Spawn the backend process now (Platform:startServer() returns
+                -- immediately) so that when getBackend() runs below,
+                -- Backend.running() is already true and its blocking
+                -- health-check wait is skipped. If this fork names Platform
+                -- differently, getBackend() still works — it just pays the
+                -- blocking wait once, here, instead of on first paint.
+                if not Backend.getInitialized()
+                        and type(Backend.running) == "function" and not Backend.running() then
+                    local ok_plat, Platform = pcall(require, "Platform")
+                    if ok_plat and type(Platform) == "table"
+                            and type(Platform.startServer) == "function" then
+                        pcall(function() Backend.server = Platform:startServer() end)
+                    end
+                end
+
+                -- getBackend() flips backendInitialized once initialize()
+                -- succeeds; then probe /library (exactly what the row calls) to
+                -- confirm the server actually answers before repainting. Retry
+                -- a few times with a short gap rather than busy-waiting here.
+                local function warmAndRefresh(attempt)
+                    pcall(Backend.getBackend)
+                    local served = false
+                    if Backend.getInitialized() then
+                        local ok_req, resp = pcall(Backend.requestJson, { path = "/library", timeout = 2 })
+                        served = ok_req and type(resp) == "table" and resp.type == "SUCCESS"
+                    end
+                    if served then
+                        local ok_m, RowMod = pcall(require, "desktop_modules/module_rakuyomi_row")
+                        if ok_m and RowMod and type(RowMod.reset) == "function" then
+                            pcall(RowMod.reset)
+                        end
+                        local HS = package.loaded["sui_homescreen"]
+                        local hs = HS and HS._instance
+                        if hs then
+                            local ok_slot, done = pcall(hs._refreshBookModSlot, hs, "rakuyomi_row")
+                            if not (ok_slot and done) then
+                                pcall(hs._refresh, hs, false)
+                            end
+                        end
+                    elseif attempt < 8 then
+                        UIManager:scheduleIn(2, function() warmAndRefresh(attempt + 1) end)
+                    end
+                end
+                warmAndRefresh(1)
+            end)
             -- Patch ReaderStatistics:onSyncBookStats to close the SimpleUI
             -- stats connection before every sync, including syncs triggered
             -- from inside the Reader (where HomescreenWidget is not on the
@@ -1260,6 +1338,7 @@ local _PLUGIN_MODULES = {
     "desktop_modules/module_stats_provider",
     "desktop_modules/sui_book_row",
     "desktop_modules/module_book_rows",
+    "desktop_modules/module_rakuyomi_row",
     "desktop_modules/module_tbr",
     "desktop_modules/module_coll_row",
     "desktop_modules/quotes",
