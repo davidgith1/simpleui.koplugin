@@ -169,20 +169,14 @@ local function _rowEnabledAnywhere()
     return false
 end
 
--- Repaint every screen that could be hosting the row, once the backend is
--- confirmed serving. Mirrors the cache-invalidation pattern used elsewhere
--- (see modules/module_coverdeck.lua).
+-- Repaint every screen that could be hosting the row. The row module's
+-- own library cache has just been primed by M.refreshNow(), so this does
+-- NOT reset it — it only forces a rebuild so build() picks the list up.
 local function _refreshScreens()
-    local ok_m, RowMod = pcall(require, ROW_MODULE)
-    if ok_m and RowMod and type(RowMod.reset) == "function" then
-        pcall(RowMod.reset)
-    end
     local ok, ScreenEngine = pcall(require, "engines/sui_screen_engine")
     if not (ok and ScreenEngine and type(ScreenEngine.knownScreenIds) == "function") then return end
     for _, sid in ipairs(ScreenEngine.knownScreenIds()) do
-        pcall(ScreenEngine.setCachedBooksState, sid, nil)
-        pcall(ScreenEngine.setCfgCache, sid, nil)
-        pcall(ScreenEngine.refreshScreen, sid, false)
+        pcall(ScreenEngine.refreshScreen, sid, true)
     end
 end
 
@@ -217,15 +211,19 @@ local function _warmup()
     end
 
     -- getBackend() flips backendInitialized once initialize() succeeds; then
-    -- probe /library (exactly what the row calls) to confirm the server
-    -- actually answers before repainting. Retry a few times with a short
-    -- gap rather than busy-waiting.
+    -- have the row module do its own /library fetch (M.refreshNow) to both
+    -- confirm the server answers and prime its cache in one call — this runs
+    -- on the deferred warm-up tick, never on a paint. Retry a few times with
+    -- a short gap rather than busy-waiting.
     local function step(attempt)
         pcall(Backend.getBackend)
         local served = false
         if Backend.getInitialized() then
-            local ok_req, resp = pcall(Backend.requestJson, { path = "/library", timeout = 2 })
-            served = ok_req and type(resp) == "table" and resp.type == "SUCCESS"
+            local ok_m, RowMod = pcall(require, ROW_MODULE)
+            if ok_m and RowMod and type(RowMod.refreshNow) == "function" then
+                local ok_r, got = pcall(RowMod.refreshNow)
+                served = ok_r and got == true
+            end
         end
         if served then
             _refreshScreens()

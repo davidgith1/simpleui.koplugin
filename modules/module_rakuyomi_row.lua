@@ -38,6 +38,7 @@ local GestureRange    = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan  = require("ui/widget/horizontalspan")
 local InputContainer  = require("ui/widget/container/inputcontainer")
+local UIManager       = require("ui/uimanager")
 local VerticalGroup   = require("ui/widget/verticalgroup")
 local _ = require("infra/sui_i18n").translate
 
@@ -91,31 +92,85 @@ local function _getBackend()
 end
 
 -- ---------------------------------------------------------------------------
--- Library fetch — short TTL cache so repeated home-screen repaints don't
--- each pay for an HTTP round trip to the backend.
+-- Library fetch — NEVER on the paint path.
+--
+-- Backend.requestJson is a blocking HTTP round trip; running it inside
+-- build() froze the home screen for up to `timeout` seconds every time the
+-- TTL cache expired. Instead build() only ever reads the cache, and a stale
+-- or missing cache schedules a deferred refresh (UIManager:scheduleIn 0)
+-- that repaints the row when the list actually changes. The blocking call
+-- still happens on that deferred tick — there is no non-blocking HTTP here —
+-- but it is off the first-paint critical path and debounced to at most once
+-- per TTL. The module_sui_rakuyomi warm-up primes the cache via
+-- M.refreshNow() on its own already-deferred tick, so the first populated
+-- paint needs no fetch of its own.
 -- ---------------------------------------------------------------------------
-local _cached_mangas, _cached_mangas_time = nil, 0
-local _CACHE_TTL = 60
+local _cached_mangas, _cached_sig = nil, nil
+local _refresh_pending = false
+local _next_refresh_at = 0          -- os.time() gate: earliest next fetch attempt
+local _CACHE_TTL   = 60             -- re-fetch a healthy library at most this often
+local _FAIL_BACKOFF = 10            -- and after a failure, wait at least this long
 
-local function _getLibraryMangas()
-    local now = os.time()
-    if _cached_mangas and (now - _cached_mangas_time < _CACHE_TTL) then
-        return _cached_mangas
+local function _sig(list)
+    local t = {}
+    for i = 1, #list do
+        local m = list[i]
+        t[i] = tostring((m and (m.id or m.title)) or i)
     end
+    return table.concat(t, "\1")
+end
+
+-- Repaint every live screen so build() re-runs against the fresh cache.
+local function _repaintRow()
+    local ok, ScreenEngine = pcall(require, "engines/sui_screen_engine")
+    if not (ok and ScreenEngine and type(ScreenEngine.knownScreenIds) == "function") then return end
+    for _, sid in ipairs(ScreenEngine.knownScreenIds()) do
+        pcall(ScreenEngine.refreshScreen, sid, true)
+    end
+end
+
+-- Blocking library fetch. Returns (got_response, list_changed). Always
+-- pushes _next_refresh_at forward so a repainting home screen can't hammer
+-- the backend.
+local function _fetchLibraryNow()
     local Backend = _getBackend()
-    if not Backend then return nil end
-    local ok, response = pcall(Backend.requestJson, { path = "/library", timeout = 3 })
+    if not Backend then                       -- backend not up: no HTTP call at all
+        _next_refresh_at = os.time() + _FAIL_BACKOFF
+        return false, false
+    end
+    local ok, response = pcall(Backend.requestJson, { path = "/library", timeout = 2 })
     if not (ok and type(response) == "table" and response.type == "SUCCESS"
                 and type(response.body) == "table") then
-        -- Transient failure (backend busy/slow) — keep serving the last good
-        -- list rather than blanking the row.
-        return _cached_mangas
+        _next_refresh_at = os.time() + _FAIL_BACKOFF
+        return false, false                   -- keep serving the last good list
     end
     local mangas = response.body
     table.sort(mangas, function(a, b) return (a.last_read or 0) > (b.last_read or 0) end)
-    _cached_mangas  = mangas
-    _cached_mangas_time = now
-    return mangas
+    local sig = _sig(mangas)
+    local changed = (sig ~= _cached_sig)
+    _cached_mangas, _cached_sig = mangas, sig
+    _next_refresh_at = os.time() + _CACHE_TTL
+    return true, changed
+end
+
+local function _scheduleLibraryRefresh()
+    if _refresh_pending then return end
+    _refresh_pending = true
+    UIManager:scheduleIn(0, function()
+        _refresh_pending = false
+        local ok, changed = _fetchLibraryNow()
+        if ok and changed then _repaintRow() end
+    end)
+end
+
+-- Cache-only read used by build(); never blocks. Arms a deferred refresh
+-- once the _next_refresh_at gate has elapsed (TTL after a good fetch, a
+-- shorter backoff after a failure, immediately on the very first call).
+local function _getCachedMangas()
+    if os.time() >= _next_refresh_at then
+        _scheduleLibraryRefresh()
+    end
+    return _cached_mangas
 end
 
 -- ---------------------------------------------------------------------------
@@ -160,10 +215,26 @@ end
 -- retrying it every repaint. Cleared on M.reset().
 local _cover_cache = {}
 
-local function _getCoverBB(cover_uri, w, h)
+local function _coverKey(cover_uri, w, h)
     local path = _filePathFromCoverURI(cover_uri)
     if not path then return nil end
-    local key = path .. "|" .. w .. "x" .. h
+    return path, path .. "|" .. w .. "x" .. h
+end
+
+-- Cache-only lookup for build(): returns a decoded BlitBuffer if one is
+-- already cached, else nil. Never touches the filesystem or the decoder.
+local function _peekCoverBB(key)
+    if not key then return nil end
+    return _cover_cache[key] or nil   -- stored value may be `false` (known failure)
+end
+
+-- Full decode path — filesystem check + decode + cache. Synchronous, but
+-- only ever called from M.updateCovers on the deferred cover poll, never
+-- from build(). One call is terminal: it caches either a BlitBuffer or
+-- `false`, so the slot never needs a second pass.
+local function _getCoverBB(cover_uri, w, h)
+    local path, key = _coverKey(cover_uri, w, h)
+    if not key then return nil end
     local cached = _cover_cache[key]
     if cached ~= nil then return cached or nil end
     local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
@@ -224,18 +295,27 @@ M.name        = _("Rakuyomi Library")
 M.label       = _("Rakuyomi Library")
 M.enabled_key = ID .. "_enabled"
 M.default_on  = false
-M.has_covers  = true   -- e-ink dithering for the cover images (no updateCovers of our own — covers are decoded synchronously in build())
+M.has_covers  = true   -- e-ink dithering + deferred decode via M.updateCovers (build() emits placeholders)
 M.is_book_mod = true   -- suppresses the "No books opened yet" empty-state when active
 
 function M.reset()
     _cover_cache = {}
-    _cached_mangas, _cached_mangas_time = nil, 0
+    _cached_mangas, _cached_sig = nil, nil
+    _refresh_pending, _next_refresh_at = false, 0
+end
+
+-- Called by the module_sui_rakuyomi warm-up (already on a deferred tick):
+-- do the blocking library fetch there so the first populated paint needs no
+-- fetch of its own. Returns true if the backend served a library list.
+function M.refreshNow()
+    local ok = _fetchLibraryNow()
+    return ok
 end
 
 local MAX_ITEMS = 5
 
 function M.build(w, ctx)
-    local mangas = _getLibraryMangas()
+    local mangas = _getCachedMangas()
     if not mangas or #mangas == 0 then return nil end
 
     local SH  = getSH()
@@ -273,18 +353,33 @@ function M.build(w, ctx)
     local cell_h  = ch + D.RB_GAP1 + label_h
 
     local row = HorizontalGroup:new{ align = "top" }
+    local pending_covers = {}
     for i = 1, cols do
         local manga = mangas[i]
 
         local inner_w_cov = math.max(1, cw - 2 * SUIStyle.BADGE_BORDER_SZ)
         local inner_h_cov = math.max(1, ch - 2 * SUIStyle.BADGE_BORDER_SZ)
-        local bb    = _getCoverBB(manga.manga_cover, inner_w_cov, inner_h_cov)
-        local cover = (bb and _wrapCover(bb, cw, ch))
-                      or SH.coverPlaceholder(manga.title,
-                            manga.source and manga.source.name, cw, ch)
 
         local cell = VerticalGroup:new{}
+
+        -- Only a cache hit produces a real cover during build(); anything not
+        -- yet decoded gets a placeholder now and is queued for the deferred
+        -- cover poll (M.updateCovers). Keeps image decode + scale + crop off
+        -- the paint path.
+        local _, key   = _coverKey(manga.manga_cover, inner_w_cov, inner_h_cov)
+        local bb       = key and _peekCoverBB(key)
+        local wrapped  = bb and _wrapCover(bb, cw, ch)
+        local cover    = wrapped
+                         or SH.coverPlaceholder(manga.title,
+                               manga.source and manga.source.name, cw, ch)
         table.insert(cell, cover)
+        if not wrapped and key and _cover_cache[key] == nil then
+            pending_covers[#pending_covers + 1] = {
+                container = cell, idx = 1,
+                uri = manga.manga_cover, iw = inner_w_cov, ih = inner_h_cov,
+                w = cw, h = ch, key = key,
+            }
+        end
         table.insert(cell, SH.vspan(D.RB_GAP1, ctx.vspan_pool))
         table.insert(cell, UI.makeColoredText{
             text      = manga.title or "?",
@@ -324,7 +419,7 @@ function M.build(w, ctx)
     local border_color = COLOR.gray or Blitbuffer.gray(0.72)
     local bg_color = solid_bg and (COLOR.surface or Blitbuffer.COLOR_WHITE) or nil
 
-    return FrameContainer:new{
+    local frame = FrameContainer:new{
         bordersize = border_sz,
         radius     = radius,
         color      = border_color,
@@ -332,6 +427,34 @@ function M.build(w, ctx)
         padding = PAD, padding_top = has_box and PAD or 0, padding_bottom = has_box and PAD or 0,
         row,
     }
+    if #pending_covers > 0 then
+        -- Read by the home screen's cover poll (engines/sui_screen_engine.lua),
+        -- which calls M.updateCovers(frame, ctx) ~1s after paint. Setting
+        -- Config.cover_extraction_pending is what arms that poll.
+        frame._cover_slots = pending_covers
+        Config.cover_extraction_pending = true
+    end
+    return frame
+end
+
+-- Deferred cover decode — called by the home screen's cover poll ~1s after
+-- build(), off the paint path. Local image decode is synchronous, so a
+-- single pass resolves every queued slot (swap in the real cover, or leave
+-- the placeholder when the file is missing / fails to decode); always
+-- returns true so the poll drops this module immediately afterward.
+function M.updateCovers(widget, _ctx)
+    local frame = (widget and widget._cover_slots and widget)
+               or (widget and widget[1] and widget[1]._cover_slots and widget[1])
+    if not (frame and frame._cover_slots) then return true end
+    for _, slot in ipairs(frame._cover_slots) do
+        if not slot.done then
+            slot.done = true
+            local bb      = _getCoverBB(slot.uri, slot.iw, slot.ih)
+            local wrapped = bb and _wrapCover(bb, slot.w, slot.h)
+            if wrapped then slot.container[slot.idx] = wrapped end
+        end
+    end
+    return true
 end
 
 -- Deliberately NOT GridRenderer.getHeight(): that formula always reserves
